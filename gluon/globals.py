@@ -27,11 +27,13 @@ import sys
 import tempfile
 import threading
 import traceback
+from email.parser import BytesParser
 from http import cookies as Cookie
 from io import BytesIO, StringIO
 from pickle import DICT, EMPTY_DICT, MARK, Pickler
 from urllib import parse as urlparse
 from urllib.parse import quote as urllib_quote
+from urllib.parse import parse_qs
 
 from pydal.contrib import portalocker
 from pydal.utils import utcnow
@@ -230,6 +232,7 @@ class Request(Storage):
         env = self.env
         post_vars = self._post_vars = Storage()
         body = self.body
+
         # if content-type is application/json, we must read the body
         is_json = env.get("CONTENT_TYPE", "")[:16] == "application/json"
 
@@ -262,39 +265,77 @@ class Request(Storage):
                 }
             else:
                 headers = None
-            dpost = cgi.FieldStorage(
-                fp=body, environ=env, headers=headers, keep_blank_values=1
-            )
-            try:
-                post_vars.update(dpost)
-            except:
-                pass
+
+            # Replacing cgi.FieldStorage
+            content_type = env.get("CONTENT_TYPE", "")
+            content_length = int(env.get("CONTENT_LENGTH", 0) or 0)
+
+            # Handle multipart/form-data
+            if content_type.startswith("multipart/form-data"):
+                # Extract boundary for parsing
+                boundary = content_type.split("boundary=")[-1].strip()
+                if not boundary:
+                    raise ValueError("No boundary in multipart form-data")
+
+                raw_data = body.read(content_length)
+                body.seek(0)
+
+                # Add boundary markers to match MIME format
+                raw_data = b"--" + boundary.encode("utf-8") + b"\r\n" + raw_data
+                parser = BytesParser()
+                msg = parser.parse(BytesIO(raw_data))
+
+                for part in msg.walk():
+                    if part.get_content_disposition() == "form-data":
+                        name = part.get_param("name", header="content-disposition")
+                        filename = part.get_param("filename", header="content-disposition")
+                        if filename:  # If part is a file upload
+                            post_vars[name] = {
+                                "filename": filename,
+                                "content": part.get_payload(decode=True),
+                            }
+                        else:  # If part is a regular field
+                            post_vars[name] = part.get_payload(decode=True).decode("utf8")
+
+            # Handle application/x-www-form-urlencoded
+            elif content_type == "application/x-www-form-urlencoded":
+                raw_data = body.read(content_length).decode("utf8")
+                body.seek(0)
+                post_vars.update(parse_qs(raw_data, keep_blank_values=True))
+
+            # Restore QUERY_STRING if it was temporarily removed
             if query_string is not None:
                 env["QUERY_STRING"] = query_string
+
             # The same detection used by FieldStorage to detect multipart POSTs
             body.seek(0)
 
+            # Helper function to handle both lists and single values
             def listify(a):
                 return (not isinstance(a, list) and [a]) or a
 
             try:
-                keys = sorted(dpost)
+                keys = sorted(post_vars)
             except TypeError:
                 keys = []
             for key in keys:
                 if key is None:
                     continue  # not sure why cgi.FieldStorage returns None key
-                dpk = dpost[key]
+                dpk = post_vars[key]
                 # if an element is not a file replace it with
                 # its value else leave it alone
 
                 pvalue = listify(
-                    [(_dpk if _dpk.filename else _dpk.value) for _dpk in dpk]
+                    [(_dpk if isinstance(_dpk, dict) and "filename" in _dpk else _dpk)
+                    for _dpk in dpk]
                     if isinstance(dpk, list)
-                    else (dpk if dpk.filename else dpk.value)
+                    else (dpk if isinstance(dpk, dict) and "filename" in dpk else dpk)
                 )
                 if len(pvalue):
                     post_vars[key] = (len(pvalue) > 1 and pvalue) or pvalue[0]
+
+        # Reset body for reuse
+        body.seek(0)
 
     @property
     def body(self):
